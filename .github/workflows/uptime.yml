@@ -14,7 +14,7 @@ jobs:
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://api.portal.betteredtech.com.br/health || echo 000)
           echo "api.portal /health -> HTTP $code"
-          if [ "$code" != "401" ]; then
+          if [ "$code" != "999" ]; then  # TESTE — reverter
             echo "::error::API fora do ar ou com resposta inesperada (HTTP $code, esperado 401)"
             exit 1
           fi
