@@ -2,90 +2,74 @@ name: Uptime Portal Alumni
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/20 * * * *'   # cada run fica ~20 min viva, sondando a cada ~1 min
   workflow_dispatch:
 
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
 jobs:
-  check:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: API /health (espera 401)
-        run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://api.portal.betteredtech.com.br/health || echo 000)
-          echo "api.portal /health -> HTTP $code"
-          if [ "$code" != "401" ]; then
-            echo "::error::API fora do ar ou com resposta inesperada (HTTP $code, esperado 401)"
-            exit 1
-          fi
-
-      - name: Web (espera 2xx/3xx)
-        run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://portal.betteredtech.com.br || echo 000)
-          echo "portal -> HTTP $code"
-          case "$code" in
-            2*|3*) ;;
-            *) echo "::error::Web fora do ar (HTTP $code)"; exit 1 ;;
-          esac
-
-      - name: Certificado da API (alerta com <14 dias de validade)
-        run: |
-          exp=$(echo | openssl s_client -connect api.portal.betteredtech.com.br:443 -servername api.portal.betteredtech.com.br 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
-          echo "cert expira em: $exp"
-          exp_s=$(date -d "$exp" +%s)
-          now_s=$(date +%s)
-          days=$(( (exp_s - now_s) / 86400 ))
-          echo "dias restantes: $days"
-          if [ "$days" -lt 14 ]; then
-            echo "::error::Certificado da API expira em $days dias - verificar renovacao no Fly (fly certs check)"
-            exit 1
-          fi
-
-  # Abre UMA issue quando o monitor falha (com mencoes - notifica sem watch) e
-  # nao duplica enquanto a queda durar. MENTIONS: adicionar o Schuarts quando
-  # soubermos o handle.
-  alert:
-    runs-on: ubuntu-latest
-    needs: check
-    if: failure()
+    timeout-minutes: 25
     permissions:
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
       MENTIONS: '@brunogilferro @inok-riak'
     steps:
-      - name: Abrir issue de incidente (se nao houver uma aberta)
+      - name: Sondar a cada ~1 min (abre/fecha issue de incidente na hora)
         run: |
-          gh label create incident --repo "$GITHUB_REPOSITORY" --color D73A4A --force >/dev/null 2>&1 || true
-          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label incident --state open --json number --jq 'length')
-          if [ "$open" = "0" ]; then
-            stamp=$(date -u '+%d/%m %H:%M')
-            run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            body=$(printf '%s - o monitor detectou falha (API /health, web ou certificado).\n\nRun: %s\n\nTriagem rapida: curl -s -o /dev/null -w "%%{http_code}" https://api.portal.betteredtech.com.br/health (esperado 401; 525 = certificado/Cloudflare -> fly certs check).' "$MENTIONS" "$run_url")
-            gh issue create --repo "$GITHUB_REPOSITORY" --label incident --title "🔴 Portal Alumni fora do ar ($stamp UTC)" --body "$body"
-          else
-            echo 'issue de incidente ja aberta - sem duplicar'
-          fi
+          api_ok() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://api.portal.betteredtech.com.br/health || echo 000)
+            [ "$code" = "401" ]
+          }
+          web_ok() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://portal.betteredtech.com.br || echo 000)
+            case "$code" in 2*|3*) return 0;; *) return 1;; esac
+          }
+          cert_ok() {
+            exp=$(echo | openssl s_client -connect api.portal.betteredtech.com.br:443 -servername api.portal.betteredtech.com.br 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            [ -z "$exp" ] && return 1
+            days=$(( ( $(date -d "$exp" +%s) - $(date +%s) ) / 86400 ))
+            echo "cert: $days dias restantes"
+            [ "$days" -ge 14 ]
+          }
 
-  # Fecha a issue sozinho quando os checks voltam a passar.
-  recover:
-    runs-on: ubuntu-latest
-    needs: check
-    if: success()
-    permissions:
-      issues: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Fechar issue de incidente aberta
-        run: |
-          num=$(gh issue list --repo "$GITHUB_REPOSITORY" --label incident --state open --json number --jq '.[0].number // empty')
-          if [ -n "$num" ]; then
-            stamp=$(date -u '+%d/%m %H:%M')
-            gh issue close "$num" --repo "$GITHUB_REPOSITORY" --comment "✅ Monitor verde de novo - portal recuperado ($stamp UTC)."
-          else
-            echo 'nenhum incidente aberto'
-          fi
+          gh label create incident --repo "$GITHUB_REPOSITORY" --color D73A4A --force >/dev/null 2>&1 || true
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label incident --state open --json number --jq '.[0].number // empty')
+
+          # cert: 1x por run (não muda minuto a minuto)
+          cert_bad=0
+          cert_ok || cert_bad=1
+
+          down=0
+          for i in $(seq 1 20); do
+            fail=0
+            api_ok || { echo "[$i] API FORA"; fail=1; }
+            web_ok || { echo "[$i] WEB FORA"; fail=1; }
+            [ "$cert_bad" = "1" ] && { echo "[$i] CERT <14 dias"; fail=1; }
+            [ "$fail" = "0" ] && echo "[$i] ok"
+
+            if [ "$fail" = "1" ] && [ -z "$issue" ]; then
+              stamp=$(date -u '+%d/%m %H:%M')
+              run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+              body=$(printf '%s - o monitor detectou falha (API /health, web ou certificado).\n\nRun: %s\n\nTriagem rapida: curl -s -o /dev/null -w "%%{http_code}" https://api.portal.betteredtech.com.br/health (esperado 401; 525 = certificado/Cloudflare -> fly certs check).' "$MENTIONS" "$run_url")
+              issue=$(gh issue create --repo "$GITHUB_REPOSITORY" --label incident --title "🔴 Portal Alumni fora do ar ($stamp UTC)" --body "$body" | grep -o '[0-9]*$')
+              echo "issue #$issue aberta"
+            elif [ "$fail" = "0" ] && [ -n "$issue" ]; then
+              stamp=$(date -u '+%d/%m %H:%M')
+              gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "✅ Monitor verde de novo - portal recuperado ($stamp UTC)."
+              echo "issue #$issue fechada"
+              issue=""
+            fi
+            down=$fail
+            [ "$i" -lt 20 ] && sleep 55
+          done
+
+          # estado final da janela: fora do ar => run falha => e-mail de run tambem
+          exit $down
 
   keepalive:
     runs-on: ubuntu-latest
