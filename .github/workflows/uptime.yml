@@ -1,0 +1,65 @@
+name: Uptime Portal Alumni
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: API /health (espera 401)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://api.portal.betteredtech.com.br/health || echo 000)
+          echo "api.portal /health -> HTTP $code"
+          if [ "$code" != "401" ]; then
+            echo "::error::API fora do ar ou com resposta inesperada (HTTP $code, esperado 401)"
+            exit 1
+          fi
+
+      - name: Web (espera 2xx/3xx)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://portal.betteredtech.com.br || echo 000)
+          echo "portal -> HTTP $code"
+          case "$code" in
+            2*|3*) ;;
+            *) echo "::error::Web fora do ar (HTTP $code)"; exit 1 ;;
+          esac
+
+      - name: Certificado da API (alerta com <14 dias de validade)
+        run: |
+          exp=$(echo | openssl s_client -connect api.portal.betteredtech.com.br:443 \
+            -servername api.portal.betteredtech.com.br 2>/dev/null \
+            | openssl x509 -noout -enddate | cut -d= -f2)
+          echo "cert expira em: $exp"
+          exp_s=$(date -d "$exp" +%s)
+          now_s=$(date +%s)
+          days=$(( (exp_s - now_s) / 86400 ))
+          echo "dias restantes: $days"
+          if [ "$days" -lt 14 ]; then
+            echo "::error::Certificado da API expira em $days dias — verificar renovação no Fly (fly certs check)"
+            exit 1
+          fi
+
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Heartbeat mensal (impede o GitHub de suspender o cron por inatividade)
+        run: |
+          # só commita se o heartbeat tiver mais de 30 dias
+          last=$(git log -1 --format=%ct -- .heartbeat 2>/dev/null || echo 0)
+          now=$(date +%s)
+          if [ $(( now - last )) -gt 2592000 ]; then
+            date -u +%Y-%m-%dT%H:%M:%SZ > .heartbeat
+            git config user.name 'uptime-bot'
+            git config user.email 'actions@github.com'
+            git add .heartbeat && git commit -m 'chore: heartbeat' && git push
+          else
+            echo 'heartbeat recente, nada a fazer'
+          fi
