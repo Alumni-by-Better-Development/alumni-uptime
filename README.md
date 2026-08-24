@@ -1,5 +1,7 @@
 # alumni-uptime
 
+![Uptime 30d](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FAlumni-by-Better-Development%2Falumni-uptime%2Fmain%2Fuptime.json)
+
 Monitor de uptime do Portal Alumni (produção). Roda a cada ~5 minutos via GitHub Actions.
 
 **Como o alerta chega:** quando um check falha, a run agendada falha e o GitHub envia

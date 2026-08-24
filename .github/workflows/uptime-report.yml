@@ -1,0 +1,51 @@
+name: Uptime Report (30d)
+
+on:
+  schedule:
+    - cron: '17 3 * * *'   # 1x por dia, 03:17 UTC
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Calcular uptime dos ultimos 30 dias (issues incident, excluindo teste)
+        run: |
+          gh issue list --repo "$GITHUB_REPOSITORY" --label incident --state all --limit 200 \
+            --json createdAt,closedAt,labels > /tmp/incidents.json
+          python3 - <<'PY'
+          import json, datetime
+          now = datetime.datetime.now(datetime.timezone.utc)
+          window_start = now - datetime.timedelta(days=30)
+          def ts(s): return datetime.datetime.fromisoformat(s.replace('Z','+00:00'))
+          downtime = datetime.timedelta()
+          for i in json.load(open('/tmp/incidents.json')):
+              if any(l['name'] == 'teste' for l in i['labels']):
+                  continue
+              start = ts(i['createdAt'])
+              end = ts(i['closedAt']) if i['closedAt'] else now  # aberto = ainda fora
+              s, e = max(start, window_start), min(end, now)
+              if e > s: downtime += (e - s)
+          total = now - window_start
+          pct = 100.0 * (1 - downtime / total)
+          color = 'brightgreen' if pct >= 99.9 else 'green' if pct >= 99.0 else 'yellow' if pct >= 97.0 else 'red'
+          msg = f"{pct:.2f}%%" if False else f"{pct:.2f}%"
+          json.dump({'schemaVersion': 1, 'label': 'uptime 30d', 'message': msg, 'color': color},
+                    open('uptime.json', 'w'))
+          mins = int(downtime.total_seconds() // 60)
+          print(f"uptime 30d: {msg} (downtime {mins} min)")
+          PY
+      - name: Publicar
+        run: |
+          git config user.name 'uptime-bot'
+          git config user.email 'actions@github.com'
+          git add uptime.json
+          git diff --cached --quiet && { echo 'sem mudança'; exit 0; }
+          git commit -m 'chore: uptime report'
+          git push
